@@ -1,0 +1,214 @@
+// msynth — a synthesizer whose deadline is audible.
+//
+//   msynth render <out.pcm>   the demo melody as raw s16le mono 44.1 kHz
+//   msynth play               the same melody, out loud
+//   msynth midi               live: play a MIDI keyboard through it
+//
+// Three modes, one synthesis rule. `render` writes the samples to a file,
+// which is what makes the sound CHECKABLE: verify.sh computes the same
+// samples independently (same formulas, same doubles) and compares byte
+// for byte. `play` pushes the same samples at a real device through the
+// audio_* queue. `midi` is the mode with a deadline: notes arrive whenever
+// a human plays them, and the queue must never run dry while a key is held
+// — the loop synthesizes a chunk whenever the queue falls below a low-water
+// mark. Missing the deadline is not a crash; it is a gap you can hear,
+// which is the failure shape of this whole domain.
+
+extern fn audio_open:   int -> int;
+extern fn audio_queue:  int -> int -> int -> int;
+extern fn audio_queued: int -> int;
+extern fn audio_close:  int -> int;
+extern fn midi_init:          int -> int;
+extern fn midi_default_input: int -> int;
+extern fn midi_open_input:    int -> int;
+extern fn midi_poll:          int -> int;
+extern fn midi_read:          int -> int;
+extern fn midi_close:         int -> int;
+extern fn mem_alloc: int -> int;
+extern fn mem_set_u8: int -> int -> int -> int;
+
+let rate = 44100;
+
+// equal temperament: MIDI note -> Hz. 440 * 2^((n-69)/12) via exp/log —
+// `pow` here is int^int and there is no float power (recorded in PAIN.md).
+// The oracle computes the same exp(log 2 * x) doubles.
+let freq_of = fn (note: int) ->
+  440.0 * exp (float_of_int (note - 69) / 12.0 * log 2.0);
+
+// One sample of one voice: sine at `f`, with a 10 ms linear attack and a
+// 30 ms linear release inside a note of `dur` samples. `i` is the sample
+// index within the note. Pure — render, play and the oracle all call this
+// shape and nothing else.
+let attack = 441;     // 10 ms
+let release = 1323;   // 30 ms
+let voice = fn (f: float) -> fn (i: int) -> fn (dur: int) ->
+  let env_a = if i < attack then float_of_int i / float_of_int attack else 1.0 in
+  let left = dur - i in
+  let env = if left < release then env_a * float_of_int left / float_of_int release
+            else env_a in
+  8000.0 * env * sin (6.283185307179586 * f * float_of_int i / 44100.0);
+
+// the demo melody: note, duration ms — a C major arpeggio and back
+let melody_notes = [60, 64, 67, 72, 67, 64, 60];
+let note_ms = 300;
+let note_samples = rate * note_ms / 1000;
+
+// s16 clamp + two's complement bytes
+let sample_bytes = fn (v: float) ->
+  let s = int_of_float v in
+  let s = if s > 32767 then 32767 else if s < 0 - 32768 then 0 - 32768 else s in
+  if s < 0 then s + 65536 else s;
+
+// ---- render: the melody into a ByteBuf, little-endian ----------------------
+let render = fn (path: str) ->
+  let out = bytebuf_new 0 in
+  let rec note = fn ns ->
+    match ns with
+    | Nil -> ()
+    | Cons (n, rest) ->
+      let f = freq_of n in
+      let rec go = fn (i: int) ->
+        if i == note_samples then ()
+        else
+          let u = sample_bytes (voice f i note_samples) in
+          let _ = bytebuf_push out (u % 256) in
+          let _ = bytebuf_push out (u / 256) in
+          go (i + 1) in
+      let _ = go 0 in
+      note rest in
+  let _ = note melody_notes in
+  let b = bytes_of_bytebuf out in
+  let _ = write_bytes path b in
+  print (str_of_int (bytes_len b) ++ " bytes -> " ++ path);
+
+// ---- play: the same samples, pushed at a device chunk by chunk -------------
+// The chunk buffer is ONE fixed arena block reused for every chunk: the
+// synthesis loop allocates nothing per sample, which verify.sh checks by
+// comparing region stats across different playback lengths.
+let chunk_samples = 4410;   // 100 ms
+let chunk_buf = mem_alloc (chunk_samples * 2);
+let low_water = rate;       // refill when under 0.5 s of audio (bytes)
+
+let synth_note_chunk = fn (f: float) -> fn (start: int) -> fn (dur: int) ->
+  // fills chunk_buf with up to chunk_samples samples of the note starting
+  // at sample offset `start`; answers how many samples were written
+  let n = if dur - start < chunk_samples then dur - start else chunk_samples in
+  let rec go = fn (i: int) ->
+    if i == n then ()
+    else
+      let u = sample_bytes (voice f (start + i) dur) in
+      let _ = mem_set_u8 chunk_buf (i * 2) (u % 256) in
+      let _ = mem_set_u8 chunk_buf (i * 2 + 1) (u / 256) in
+      go (i + 1) in
+  let _ = go 0 in
+  n;
+
+let play = fn () ->
+  let dev = audio_open rate in
+  if dev < 0 then print "no audio device"
+  else
+    let rec note = fn ns ->
+      match ns with
+      | Nil -> ()
+      | Cons (n, rest) ->
+        let f = freq_of n in
+        let rec feed = fn (start: int) ->
+          if start >= note_samples then ()
+          else if audio_queued dev > low_water then
+            // the queue is ahead of the deadline: let it drain a little
+            let _ = sleep_ms 20 in feed start
+          else
+            let wrote = synth_note_chunk f start note_samples in
+            let _ = audio_queue dev chunk_buf (wrote * 2) in
+            feed (start + wrote) in
+        let _ = feed 0 in
+        note rest in
+    let _ = note melody_notes in
+    let rec drain = fn (u: unit) ->
+      if audio_queued dev == 0 then ()
+      else let _ = sleep_ms 20 in drain () in
+    let _ = drain () in
+    let _ = audio_close dev in
+    print "played";
+
+// ---- midi: live keys, hard deadline ----------------------------------------
+// Voice state is a 128-slot age table (samples since note-on; -1 = off) in a
+// Vec — no per-event allocation. Each 50 ms chunk sums the active voices;
+// the queue is refilled whenever it dips under the low-water mark.
+let live_chunk = 2205;      // 50 ms
+let ages = vec_new ();
+let init_ages =
+  let rec go = fn (i: int) ->
+    if i == 128 then () else let _ = vec_push ages (0 - 1) in go (i + 1) in
+  go 0;
+
+let synth_live_chunk = fn () ->
+  let rec sample = fn (i: int) ->
+    if i == live_chunk then ()
+    else
+      let rec sum = fn (n: int) -> fn (acc: float) ->
+        if n == 128 then acc
+        else
+          let age = vec_get ages n in
+          if age < 0 then sum (n + 1) acc
+          else
+            // held notes sustain: a long nominal duration, release on note-off
+            sum (n + 1) (acc + voice (freq_of n) (age + i) 1000000000) in
+      let u = sample_bytes (sum 0 0.0) in
+      let _ = mem_set_u8 chunk_buf (i * 2) (u % 256) in
+      let _ = mem_set_u8 chunk_buf (i * 2 + 1) (u / 256) in
+      sample (i + 1) in
+  let _ = sample 0 in
+  let rec bump = fn (n: int) ->
+    if n == 128 then ()
+    else
+      let age = vec_get ages n in
+      let _ = if age >= 0 then vec_set ages n (age + live_chunk) else () in
+      bump (n + 1) in
+  bump 0;
+
+let midi_live = fn () ->
+  let _ = midi_init 0 in
+  let inp = midi_default_input 0 in
+  if inp < 0 then print "no MIDI input"
+  else
+    let h = midi_open_input inp in
+    let dev = audio_open rate in
+    if dev < 0 then print "no audio device"
+    else
+      let _ = print "playing (ctrl-c to quit)" in
+      let rec loop = fn (u: unit) ->
+        // drain every pending MIDI event first: latency is the deadline here
+        let rec events = fn (u: unit) ->
+          if midi_poll h == 1 then
+            let m = midi_read h in
+            let status = m % 256 in
+            let note = m / 256 % 256 in
+            let vel = m / 65536 % 256 in
+            let kind = status / 16 in
+            let _ =
+              if kind == 9 && vel > 0 then vec_set ages note 0
+              else if kind == 8 || (kind == 9 && vel == 0) then vec_set ages note (0 - 1)
+              else () in
+            events ()
+          else () in
+        let _ = events () in
+        let _ =
+          if audio_queued dev < low_water then
+            let _ = synth_live_chunk () in
+            let _ = audio_queue dev chunk_buf (live_chunk * 2) in
+            ()
+          else sleep_ms 5 in
+        loop () in
+      loop ();
+
+let usage = "usage: msynth render <out.pcm> | msynth play | msynth midi";
+
+let main = fn () ->
+  match args () with
+  | Cons ("render", Cons (path, _)) -> render path
+  | Cons ("play", _) -> play ()
+  | Cons ("midi", _) -> midi_live ()
+  | _ -> print usage;
+let _ = main () in
+exit 0
